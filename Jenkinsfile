@@ -1,6 +1,10 @@
 pipeline {
   agent any
 
+   tools {
+        nodejs 'node20'
+    }
+
   environment {
     IMAGE_NAME = "theshubhamgour/github-profile-summarizer"
     IMAGE_TAG = "v${env.BUILD_NUMBER}"
