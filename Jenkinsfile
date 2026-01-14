@@ -6,7 +6,7 @@ pipeline {
     }
 
   environment {
-    IMAGE_NAME = "theshubhamgour/github-profile-summarizer"
+    IMAGE_NAME = "raveenkumarofficial2025/github-profile-summarizer"
     IMAGE_TAG = "v${env.BUILD_NUMBER}"
     MAX_REPOS = "50"
   }
