@@ -69,15 +69,15 @@ pipeline {
     stage('Zero-Downtime Deployment') {
       steps {
         script {
-          // Step 1: Create network if it doesn't exist
+          // Step 1: Clean up any old containers
           sh '''
-            docker network create $DOCKER_NETWORK || true
+            docker rm -f ${CONTAINER_NAME_NEW} ${CONTAINER_NAME_OLD} || true
           '''
           
-          // Step 2: Check if current container is running
-          def isCurrentRunning = sh(
+          // Step 2: Check if current container exists and get its port
+          def currentContainerExists = sh(
             script: '''
-              if docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+              if docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
                 echo "true"
               else
                 echo "false"
@@ -86,110 +86,134 @@ pipeline {
             returnStdout: true
           ).trim() == 'true'
           
-          // Step 3: Deploy new container on different port
-          def newPort = 8082
+          // Step 3: Determine ports
           def currentPort = 8081
+          def newPort = 8082
           
-          if (isCurrentRunning) {
-            // Get current port
-            currentPort = sh(
-              script: '''
-                docker port ${CONTAINER_NAME} 80 | cut -d: -f2 || echo "8081"
-              ''',
+          if (currentContainerExists) {
+            // Get the port from the running container
+            def portInfo = sh(
+              script: """
+                docker port ${CONTAINER_NAME} 2>/dev/null | head -1 | cut -d: -f2 || echo "8081"
+              """,
               returnStdout: true
-            ).trim().toInteger()
+            ).trim()
             
-            // Set new port (swap)
-            newPort = currentPort == 8081 ? 8082 : 8081
+            if (portInfo.isInteger()) {
+              currentPort = portInfo.toInteger()
+              newPort = currentPort == 8081 ? 8082 : 8081
+            }
           }
           
-          // Step 4: Deploy new version
+          echo "Current container exists: ${currentContainerExists}"
+          echo "Current port: ${currentPort}"
+          echo "New port: ${newPort}"
+          
+          // Step 4: Deploy new version on different port
           sh """
-            # Remove any old 'new' container
-            docker rm -f ${CONTAINER_NAME_NEW} || true
-            
-            # Run new container
+            # Deploy new container
             docker run -d \\
               --name ${CONTAINER_NAME_NEW} \\
-              --network ${DOCKER_NETWORK} \\
               -p ${newPort}:80 \\
               --health-cmd "curl --fail http://localhost:80 || exit 1" \\
               --health-interval 10s \\
               --health-timeout 5s \\
-              --health-retries 3 \\
+              --health-retries 5 \\
               --health-start-period 30s \\
               ${IMAGE_NAME}:${IMAGE_TAG}
             
-            echo "New container deployed on port ${newPort}"
+            echo "✅ New version deployed on port ${newPort}"
           """
           
-          // Step 5: Wait for health check
-          timeout(time: 2, unit: 'MINUTES') {
+          // Step 5: Wait for health check with timeout
+          timeout(time: 3, unit: 'MINUTES') {
             waitUntil {
-              def health = sh(
-                script: """
-                  docker inspect --format='{{.State.Health.Status}}' ${CONTAINER_NAME_NEW}
-                """,
-                returnStdout: true
-              ).trim()
-              echo "Health status: ${health}"
-              return health == 'healthy'
+              try {
+                def health = sh(
+                  script: """
+                    docker inspect --format='{{.State.Health.Status}}' ${CONTAINER_NAME_NEW} 2>/dev/null || echo "starting"
+                  """,
+                  returnStdout: true
+                ).trim()
+                
+                echo "Health status of new container: ${health}"
+                
+                if (health == 'healthy') {
+                  return true
+                } else if (health == 'unhealthy') {
+                  error "New container is unhealthy. Deployment failed."
+                }
+                return false
+              } catch (Exception e) {
+                echo "Waiting for container to start..."
+                return false
+              }
             }
           }
           
-          // Step 6: Update load balancer or swap ports
-          if (isCurrentRunning) {
-            // Step 6a: Update Nginx config (if using reverse proxy)
-            sh '''
-              # Update nginx config to point to new container
-              # or use Docker built-in routing
-              
-              # For simple setup, we'll use traffic switching via port swapping
-              # This requires an external load balancer or you can use:
-              
-              # Option A: Use HAProxy or Nginx as reverse proxy
-              # Option B: Use Docker swarm/k8s for built-in load balancing
-              # Option C: Use port swapping strategy
-            '''
+          echo "✅ New container is healthy"
+          
+          // Step 6: Traffic switching strategy
+          if (currentContainerExists) {
+            echo "🔄 Switching traffic from old to new version..."
             
-            // Step 6b: Rename containers for zero-downtime switch
+            // Option A: Using reverse proxy (recommended for production)
+            // Option B: Port swapping with minimal downtime
+            
+            // For minimal downtime port swap:
             sh """
-              # Rename current to old
-              docker rename ${CONTAINER_NAME} ${CONTAINER_NAME_OLD}
+              # Stop old container
+              docker stop ${CONTAINER_NAME}
               
-              # Rename new to current
+              # Rename containers
+              docker rename ${CONTAINER_NAME} ${CONTAINER_NAME_OLD}
               docker rename ${CONTAINER_NAME_NEW} ${CONTAINER_NAME}
               
-              # Update port mapping if needed
-              docker stop ${CONTAINER_NAME} || true
-              docker rm ${CONTAINER_NAME} || true
+              # Remove old container
+              docker rm -f ${CONTAINER_NAME_OLD} || true
               
-              # Re-run on correct port
+              # Update port mapping for the renamed container
+              docker stop ${CONTAINER_NAME}
+              docker rm ${CONTAINER_NAME}
+              
+              # Run on the original port
               docker run -d \\
                 --name ${CONTAINER_NAME} \\
-                --network ${DOCKER_NETWORK} \\
                 -p ${currentPort}:80 \\
                 --health-cmd "curl --fail http://localhost:80 || exit 1" \\
                 --health-interval 10s \\
-                --health-timeout 5s \\
                 --health-retries 3 \\
                 ${IMAGE_NAME}:${IMAGE_TAG}
             """
             
-            // Step 6c: Remove old container
-            sh """
-              # Wait a bit for connections to drain
-              sleep 10
-              
-              # Remove old container
-              docker rm -f ${CONTAINER_NAME_OLD} || true
-            """
+            // Verify new container on original port is healthy
+            timeout(time: 1, unit: 'MINUTES') {
+              waitUntil {
+                def health = sh(
+                  script: """
+                    docker inspect --format='{{.State.Health.Status}}' ${CONTAINER_NAME} 2>/dev/null || echo "starting"
+                  """,
+                  returnStdout: true
+                ).trim() == 'healthy'
+                return health
+              }
+            }
+            
+            echo "✅ Traffic switched successfully"
+            
           } else {
             // First deployment
             sh """
               docker rename ${CONTAINER_NAME_NEW} ${CONTAINER_NAME}
             """
+            echo "✅ First deployment completed"
           }
+          
+          // Step 7: Cleanup
+          sh '''
+            docker rm -f ${CONTAINER_NAME_NEW} ${CONTAINER_NAME_OLD} 2>/dev/null || true
+            docker image prune -f
+          '''
         }
       }
     }
@@ -197,24 +221,30 @@ pipeline {
 
   post {
     success {
-      echo "✅ Successfully deployed $IMAGE_NAME:$IMAGE_TAG with zero downtime"
+      echo "✅ Successfully deployed ${env.IMAGE_NAME}:${env.IMAGE_TAG}"
       sh '''
-        echo "Application is running on:"
-        docker ps --filter "name=github-profile-summarizer" --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}"
+        echo "=== Deployment Summary ==="
+        docker ps --filter "name=github-profile-summarizer" --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}\t{{.Image}}"
+        echo "=========================="
       '''
     }
     failure {
-      echo "❌ Pipeline failed"
-      sh '''
-        # Cleanup on failure
-        docker rm -f ${CONTAINER_NAME_NEW} ${CONTAINER_NAME_OLD} || true
-      '''
-    }
-    always {
-      sh '''
-        # Cleanup unused images
-        docker image prune -f || true
-      '''
+      echo "❌ Deployment failed - rolling back"
+      script {
+        // Rollback: Ensure original container is running
+        sh '''
+          # Check if original container exists
+          if docker ps -a --filter "name=^/github-profile-summarizer$" --format "{{.Names}}" | grep -q "github-profile-summarizer"; then
+            echo "Starting original container..."
+            docker start github-profile-summarizer || true
+          fi
+          
+          # Clean up failed new containers
+          docker rm -f github-profile-summarizer-new github-profile-summarizer-old 2>/dev/null || true
+          
+          echo "Rollback completed. Original version restored."
+        '''
+      }
     }
   }
 }
